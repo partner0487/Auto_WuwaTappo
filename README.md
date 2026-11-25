@@ -67,7 +67,7 @@ python auto_tappo.py --dry    # 只偵測不點擊
 
 ### 換寶箱模板
 寶箱外觀改變時：等寶箱出現時 `python auto_tappo.py snap`，把寶箱圖示（只裁圖示本體）
-存成 PNG 放進 `templates/`，並把 `auto_tappo.py` 的 `CHEST_BUBBLE_H` 改成截圖時寶箱泡泡框的高度（像素），
+存成 PNG 放進 `templates/`，並把 `auto_tappo.py` 的 `CHEST_BUBBLE_H`、`CHEST_BUBBLE_W` 改成截圖時寶箱泡泡框的高、寬（像素），
 程式會以此為基準依實際泡泡大小縮放模板。
 
 ## 授權

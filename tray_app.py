@@ -63,10 +63,21 @@ class TrayApp:
         core.stop_event.set()
         self.icon.stop()
 
+    def notify_started(self):
+        """啟動通知：告訴使用者程式在背景執行、在哪裡操作，並提示是否偵測到桌寵。"""
+        if core.is_running():  # 已有一份在跑，交給 worker 顯示「已在執行」
+            return
+        if core.find_pet_window():
+            msg = "已在背景執行，偵測到桌寵。\n右下角圖示：滑鼠停留看狀態，右鍵可結束。"
+        else:
+            msg = "已在背景執行，但還沒偵測到桌寵，請開啟 Wuwa Tappo。\n右下角圖示右鍵可結束。"
+        self.icon.notify(msg, APP_NAME)
+
     def worker(self):
         args = argparse.Namespace(threshold=0.85, interval=30.0, max_wait=600.0, poll=5.0,
                                   dry=False)
         try:
+            self.notify_started()
             ok = core.cmd_run(args)
             if ok is False:
                 self.icon.notify("已經有一份在執行了（或缺少寶箱模板），這個視窗將關閉。", APP_NAME)

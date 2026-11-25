@@ -12,7 +12,7 @@
     python auto_tappo.py --dry    # 只偵測不點擊
 
 模板：寶箱圖示存成 PNG 放進 templates/。比對時依泡泡框高度自動縮放模板，
-所以桌寵大小、螢幕縮放比例不同都能偵測（CHEST_BUBBLE_H 為截模板時的泡泡高度）。
+所以桌寵大小、螢幕縮放比例不同都能偵測（CHEST_BUBBLE_H/W 為截模板時的泡泡高、寬）。
 """
 import argparse
 import asyncio
@@ -63,8 +63,10 @@ BUBBLE_HSV_HI = (35, 150, 255)
 BUBBLE_W = (18, 180)
 BUBBLE_H = (9, 100)
 BUBBLE_ASPECT = (1.0, 3.2)  # 寬/高：倒數泡泡約 2.0、寶箱泡泡約 1.4；金額/名牌長條框 >4
-# 模板 templates/chest.png 截取時，寶箱泡泡框的高度（像素）。比對時依實際泡泡高度等比縮放模板
+BUBBLE_ERODE = (0, 2, 4, 7, 11)  # 分離黏在一起的泡泡用的侵蝕半徑（螢幕 100% 下像素，依 DPI 放大）
+# 模板 templates/chest.png 截取時，寶箱泡泡框的高、寬（像素）。比對時依實際泡泡高度等比縮放模板
 CHEST_BUBBLE_H = 44
+CHEST_BUBBLE_W = 61
 # OCR 前把倒數泡泡放大到這個高度（像素）
 TIMER_OCR_H = 86
 OCR_LANG_PREF = ["en-US", "en-GB", "en"]  # 依序嘗試，都沒有就用系統語言
@@ -184,14 +186,16 @@ def resize(img, k):
                       interpolation=cv2.INTER_AREA if k < 1 else cv2.INTER_CUBIC)
 
 
-def match_chest(crop, bubble_h, tpls, threshold):
-    """在泡泡內比對寶箱。模板縮放倍率由泡泡高度推算（自動適應桌寵大小與螢幕 DPI），
-    並在推算值附近多試幾個倍率以容忍誤差。回傳 (分數, 中心x, 中心y, 模板名) 或 None。"""
-    est = bubble_h / CHEST_BUBBLE_H
+def match_chest(crop, bubble_w, bubble_h, tpls, threshold):
+    """在泡泡內比對寶箱。模板縮放倍率由泡泡寬、高分別推算（自動適應桌寵大小與螢幕 DPI），
+    並在推算值附近多試幾個倍率以容忍誤差。泡泡黏到旁邊東西時寬或高其一會偏大，兩者都試。
+    回傳 (分數, 中心x, 中心y, 模板名) 或 None。"""
+    ests = [bubble_w / CHEST_BUBBLE_W, bubble_h / CHEST_BUBBLE_H]
+    scales = sorted({round(e * m, 2) for e in ests for m in (0.88, 0.94, 1.0, 1.06, 1.13)})
     best = None
     for name, tpl in tpls:
-        for m in (0.88, 0.94, 1.0, 1.06, 1.13):
-            t = resize(tpl, est * m)
+        for k in scales:
+            t = resize(tpl, k)
             th, tw = t.shape[:2]
             if th < 8 or th > crop.shape[0] or tw > crop.shape[1]:
                 continue
@@ -204,24 +208,64 @@ def match_chest(crop, bubble_h, tpls, threshold):
 def find_bubbles(frame, scale):
     """用底色找泡泡框，回傳 [(x, y, w, h, region)]（視窗內座標）。
     region 是 bbox 內「泡泡內部」的遮罩（含文字/圖示的洞），用來排除外框與背景。
-    大小範圍放寬到涵蓋桌寵 50%~200%，再用長寬比排除金額、名牌等長條框。"""
+    大小範圍放寬到涵蓋桌寵 50%~200%，再用長寬比排除金額、名牌等長條框。
+
+    桌寵放大時，泡泡的尾巴會黏到隔壁泡泡、或碰到桌寵的淺色頭髮，連成一大塊。
+    所以依序用不同強度侵蝕（切斷細連接）→ 分塊 → 膨脹回原大小，任一強度下符合泡泡形狀就收下，
+    最後去掉重疊的重複結果（優先保留侵蝕較少、形狀較完整的）。"""
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, BUBBLE_HSV_LO, BUBBLE_HSV_HI)
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
     boxes = []
-    for i, (x, y, w, h, area) in enumerate(stats):
-        if i == 0:
-            continue
-        if BUBBLE_W[0] * scale <= w <= BUBBLE_W[1] * scale \
-                and BUBBLE_H[0] * scale <= h <= BUBBLE_H[1] * scale \
-                and BUBBLE_ASPECT[0] <= w / h <= BUBBLE_ASPECT[1] \
-                and area >= 0.35 * w * h:
-            comp = (labels[y:y + h, x:x + w] == i).astype(np.uint8) * 255
+    for e in BUBBLE_ERODE:
+        e = round(e * scale)
+        if e:
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * e + 1, 2 * e + 1))
+            work = cv2.erode(mask, k)
+        else:
+            k, work = None, mask
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(work)
+        for i in range(1, n):
+            x, y, w, h, _ = stats[i]
+            if e:  # 膨脹回原大小（限制在原遮罩內）
+                x0, y0 = max(x - e, 0), max(y - e, 0)
+                x1, y1 = min(x + w + e, mask.shape[1]), min(y + h + e, mask.shape[0])
+                comp = (labels[y0:y1, x0:x1] == i).astype(np.uint8) * 255
+                comp = cv2.dilate(comp, k) & mask[y0:y1, x0:x1]
+                ys, xs = np.nonzero(comp)
+                if len(xs) == 0:
+                    continue
+                x, y = x0 + xs.min(), y0 + ys.min()
+                w, h = xs.max() - xs.min() + 1, ys.max() - ys.min() + 1
+                comp = comp[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+            else:
+                comp = (labels[y:y + h, x:x + w] == i).astype(np.uint8) * 255
+            area = cv2.countNonZero(comp)
+            if not (BUBBLE_W[0] * scale <= w <= BUBBLE_W[1] * scale
+                    and BUBBLE_H[0] * scale <= h <= BUBBLE_H[1] * scale
+                    and BUBBLE_ASPECT[0] <= w / h <= BUBBLE_ASPECT[1]
+                    and area >= 0.35 * w * h):
+                continue
+            # 與已收下的重疊就略過
+            if any(_overlap((x, y, w, h), b[:4]) > 0.5 for b in boxes):
+                continue
             cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             region = np.zeros_like(comp)
             cv2.drawContours(region, cnts, -1, 255, cv2.FILLED)  # 補上文字造成的洞
             boxes.append((int(x), int(y), int(w), int(h), region))
     return boxes
+
+
+def _overlap(a, b):
+    """兩個框的 IoU（交集／聯集）。只有位置與大小都相近才算重複；
+    小框完全落在大框內（例如寶箱圖示裡的淺色星星）不算，避免把真正的泡泡丟掉。"""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    iw = min(ax + aw, bx + bw) - max(ax, bx)
+    ih = min(ay + ah, by + bh) - max(ay, by)
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    inter = iw * ih
+    return inter / (aw * ah + bw * bh - inter)
 
 
 _ocr_engine = None
@@ -303,7 +347,7 @@ def scan(hwnd, threshold):
         pad = max(4, h // 6)
         x0, y0 = max(x - pad, 0), max(y - pad, 0)
         crop = frame[y0:y + h + pad, x0:x + w + pad]
-        hit = match_chest(crop, h, tpls, threshold)
+        hit = match_chest(crop, w, h, tpls, threshold)
         if hit:
             score, cx, cy, name = hit
             chests.append((ox + x0 + cx, oy + y0 + cy, score, name))
