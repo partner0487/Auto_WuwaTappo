@@ -336,14 +336,34 @@ def read_timer(crop, region):
     return None
 
 
-def scan(hwnd, threshold):
-    """掃一次桌寵視窗。回傳 (chests=[(螢幕x, 螢幕y, 分數, 模板名)], timers=[秒數])。"""
+def owned_by_pet(pid, points):
+    """這些螢幕座標中，是否有任一點實際屬於桌寵程式。
+    桌寵視窗透明的地方滑鼠會穿透到後面的視窗，WindowFromPoint 會回傳後面的視窗，
+    藉此排除 Discord、網頁等其他視窗裡出現的 Tappo 圖片。"""
+    for pt in points:
+        hw = win32gui.WindowFromPoint(pt)
+        if hw and win32process.GetWindowThreadProcessId(hw)[1] == pid:
+            return True
+    return False
+
+
+def scan(hwnd, threshold, check_owner=True):
+    """掃一次桌寵視窗。回傳 (chests=[(螢幕x, 螢幕y, 分數, 模板名)], timers=[秒數])。
+    check_owner：只採用確實屬於桌寵程式的泡泡（測試離線截圖時設 False）。"""
     dpi = window_dpi(hwnd)
     scale = dpi / 96
     frame, (ox, oy) = grab(hwnd)
     tpls = load_templates()
+    pid = win32process.GetWindowThreadProcessId(hwnd)[1] if check_owner else None
     chests, timers = [], []
     for x, y, w, h, region in find_bubbles(frame, scale):
+        if check_owner:
+            ys, xs = np.nonzero(region)
+            cx, cy = int(xs.mean()), int(ys.mean())  # 泡泡內部的重心，再加左右兩點
+            pts = [(ox + x + cx, oy + y + cy),
+                   (ox + x + cx - w // 4, oy + y + cy), (ox + x + cx + w // 4, oy + y + cy)]
+            if not owned_by_pet(pid, pts):
+                continue
         pad = max(4, h // 6)
         x0, y0 = max(x - pad, 0), max(y - pad, 0)
         crop = frame[y0:y + h + pad, x0:x + w + pad]
