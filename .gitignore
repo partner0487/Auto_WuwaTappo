@@ -1,0 +1,7 @@
+snaps/
+logs/
+.stop
+__pycache__/
+build/
+dist/
+*.spec
