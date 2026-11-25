@@ -2,7 +2,7 @@
 
 右鍵選單：開啟視窗／立即檢查／開啟紀錄（視窗內的紀錄面板）／結束。雙擊圖示開啟視窗。
 啟動時若已有一份在執行（例如舊版），會先請它結束再接手。
-每天檢查一次 GitHub 上有沒有新版本，有的話提示（不會自動下載）。
+每天檢查一次 GitHub 上有沒有新版本（也可手動檢查），有的話提示（不會自動下載）。
 打包成 exe 時會內嵌系統管理員權限需求（--uac-admin），開啟時跳一次 UAC。
 """
 import argparse
@@ -13,6 +13,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import urllib.request
 from datetime import datetime
@@ -57,11 +58,13 @@ def latest_release():
 class TrayApp:
     def __init__(self):
         self.tasks = queue.Queue()  # 其他執行緒要操作視窗時，丟進來由主執行緒執行
+        self.update_now = threading.Event()  # 手動檢查更新
         self.root = tk.Tk()
         try:
             self.win = MainWindow(self.root, ICON_PATH, self.check_now, self.open_log, self.quit)
             self.win.on_hide_first = lambda: self.icon.notify(
                 "已縮到右下角，程式持續執行。\n雙擊圖示可再開啟視窗，右鍵可結束。", APP_NAME)
+            self.win.on_check_update = self.check_update_now
         except Exception as e:  # 視窗壞掉也要能繼續自動領取
             core.log(f"狀態視窗無法建立，僅以系統匣執行：{e!r}")
             self.win = None
@@ -77,6 +80,7 @@ class TrayApp:
                                  default=True),  # 左鍵雙擊
                 pystray.MenuItem("立即檢查", self.check_now),
                 pystray.MenuItem("開啟紀錄", lambda *_: self.tasks.put(self.show_log)),
+                pystray.MenuItem("檢查更新", self.check_update_now),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("結束", self.quit),
             ))
@@ -130,11 +134,23 @@ class TrayApp:
                 None, f"發生錯誤而停止：{e}", APP_NAME, 0x10))
         core.stop_event.set()
 
+    def check_update_now(self, *_):
+        """手動檢查更新（視窗的「檢查更新」或系統匣選單）。"""
+        if self.win:
+            self.tasks.put(lambda: self.win.set_update_status("checking"))
+        self.update_now.set()
+
+    def _ui(self, fn):
+        if self.win:
+            self.tasks.put(fn)
+
     def update_checker(self):
-        if core.stop_event.wait(5):
-            return
+        """啟動 5 秒後檢查一次，之後每天一次；手動觸發時立即檢查。"""
+        self.update_now.wait(5)
         notified = None
-        while True:
+        while not core.stop_event.is_set():
+            self.update_now.clear()
+            self._ui(lambda: self.win.set_update_status("checking"))
             try:
                 tag, url = latest_release()
                 if _ver(tag) > _ver(core.VERSION):
@@ -142,12 +158,18 @@ class TrayApp:
                         core.log(f"有新版本 {tag}：{url}")
                         self.icon.notify(f"有新版本 {tag}，開啟視窗可前往下載。", APP_NAME)
                         notified = tag
-                    if self.win:
-                        self.tasks.put(lambda t=tag, u=url: self.win.set_update(t, u))
+                    self._ui(lambda t=tag, u=url: (self.win.set_update(t, u),
+                                                   self.win.set_update_status("new", t)))
+                else:
+                    core.log(f"檢查更新：目前 v{core.VERSION} 已是最新版本")
+                    self._ui(lambda: self.win.set_update_status("latest"))
             except Exception as e:
                 core.log(f"檢查更新失敗：{e}")
-            if core.stop_event.wait(UPDATE_EVERY):
-                return
+                self._ui(lambda: self.win.set_update_status("fail"))
+            end = time.time() + UPDATE_EVERY
+            while time.time() < end and not core.stop_event.is_set():
+                if self.update_now.wait(1):
+                    break
 
     def poll(self):
         while True:

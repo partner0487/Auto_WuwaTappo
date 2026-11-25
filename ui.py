@@ -89,8 +89,16 @@ class MainWindow:
         tt.pack(side="left")
         tk.Label(tt, text="Wuwa Tappo 自動領寶箱", bg=BG, fg=TEXT,
                  font=(FONT, 13, "bold")).pack(anchor="w")
-        tk.Label(tt, text=f"v{core.VERSION}　・　在背景自動點寶箱", bg=BG, fg=MUTED,
-                 font=(FONT, 9)).pack(anchor="w")
+        sub = tk.Frame(tt, bg=BG)
+        sub.pack(anchor="w")
+        tk.Label(sub, text=f"v{core.VERSION}　・　", bg=BG, fg=MUTED,
+                 font=(FONT, 9)).pack(side="left")
+        self.upd = tk.Label(sub, text="檢查更新", bg=BG, fg=ACCENT, cursor="hand2",
+                            font=(FONT, 9, "underline"))
+        self.upd.pack(side="left")
+        self.upd.bind("<Button-1>", lambda e: self._click_update())
+        self._upd_kind = "idle"
+        self.on_check_update = None  # 由系統匣設定：手動檢查更新
 
         # 更新提示（有新版才顯示）
         self.notice = tk.Frame(body, bg=NOTICE, padx=12, pady=8)
@@ -279,6 +287,26 @@ class MainWindow:
         self.update_url = url
         self.notice_text.config(text=f"有新版本 {tag} 可以下載")
         self.notice.pack(fill="x", pady=(14, 0), before=self.notice_anchor)
+
+    def set_update_status(self, kind, tag=None):
+        """kind：checking / latest / new / fail。顯示在標題的版本號旁邊。"""
+        self._upd_kind = kind
+        text, fg, font, cur = {
+            "checking": ("檢查中…", MUTED, (FONT, 9), "arrow"),
+            "latest": ("已是最新版 ✓", MUTED, (FONT, 9), "hand2"),
+            "new": (f"下載新版 {tag} ›", ACCENT, (FONT, 9, "bold underline"), "hand2"),
+            "fail": ("檢查失敗，重試", BAD, (FONT, 9, "underline"), "hand2"),
+        }[kind]
+        self.upd.config(text=text, fg=fg, font=font, cursor=cur)
+
+    def _click_update(self):
+        if self._upd_kind == "checking":
+            return
+        if self._upd_kind == "new":
+            self._open_update()
+        elif self.on_check_update:
+            self.set_update_status("checking")
+            self.on_check_update()
 
     def _open_update(self):
         if self.update_url:
