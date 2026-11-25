@@ -1,4 +1,4 @@
-"""由 assets/logo.jfif 產生 App 圖示：去白背景 → 置中成正方形 → 右下角加滑鼠點擊游標。
+"""由 logo 圖（預設 assets/logo.jfif，未收進 repo）產生 App 圖示：去白背景 → 置中成正方形 → 右下角加滑鼠點擊游標。
 
 輸出 assets/icon.png（512px）與 assets/icon.ico（16~256 多尺寸）。
 用法：python tools/make_icon.py [logo路徑]
@@ -81,6 +81,8 @@ def draw_cursor(size):
 
 
 def main():
+    if not os.path.exists(SRC):
+        sys.exit(f"找不到 logo 原圖：{SRC}（用法：python tools/make_icon.py <圖片路徑>）")
     os.makedirs(OUT_DIR, exist_ok=True)
     rgb = np.array(Image.open(SRC).convert("RGB"))
     logo = fit_square(remove_white_bg(rgb), SIZE)

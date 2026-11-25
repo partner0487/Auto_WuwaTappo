@@ -27,8 +27,8 @@
 auto_tappo.py        核心：偵測泡泡、OCR 倒數、點擊；也可單獨用命令列執行
 tray_app.py          系統匣 App（打包成 exe 的進入點）
 templates/chest.png  寶箱模板（150% 縮放下截取）
-assets/              logo 原圖與產生的圖示（icon.png / icon.ico）
-tools/make_icon.py   由 logo 產生圖示：去背＋加滑鼠游標
+assets/              App 圖示（icon.png / icon.ico）
+tools/make_icon.py   由 logo 圖產生圖示：去背＋加滑鼠游標（logo 原圖不在 repo）
 build.bat            用 PyInstaller 打包成 dist\AutoWuwaTappo.exe
 ```
 
