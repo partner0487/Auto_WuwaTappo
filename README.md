@@ -19,14 +19,16 @@
 2. 泡泡是寶箱 → 點擊領取（模板比對 `templates/chest.png`）。
 3. 泡泡是倒數（mm:ss）→ 用 Windows 內建 OCR 讀時間，睡到最短的倒數結束再檢查；
    最多 10 分鐘會重新確認一次，防止桌寵被移動或 OCR 讀錯。
+4. 時間到後每 5 秒檢查一次，直到偵測到寶箱並點掉。
 
-支援多螢幕與不同縮放比例（模板依桌寵所在螢幕的 DPI 自動縮放）。
+支援多螢幕、不同螢幕縮放比例與桌寵大小（模板依泡泡框大小自動縮放，以縮放截圖模擬測過桌寵 50%～200%）。
+桌寵 50% 且螢幕縮放 100% 時倒數字太小讀不到，會改為每 30 秒檢查寶箱。
 
 ## 專案結構
 ```
 auto_tappo.py        核心：偵測泡泡、OCR 倒數、點擊；也可單獨用命令列執行
 tray_app.py          系統匣 App（打包成 exe 的進入點）
-templates/chest.png  寶箱模板（150% 縮放下截取）
+templates/chest.png  寶箱模板（比對時依泡泡大小自動縮放）
 assets/              App 圖示（icon.png / icon.ico）
 tools/make_icon.py   由 logo 圖產生圖示：去背＋加滑鼠游標（logo 原圖不在 repo）
 build.bat            用 PyInstaller 打包成 dist\AutoWuwaTappo.exe
@@ -54,6 +56,7 @@ python auto_tappo.py --dry    # 只偵測不點擊
 | 參數 | 預設 | 說明 |
 |---|---|---|
 | `--max-wait` | 600 | 倒數時最多睡幾秒就重新確認 |
+| `--poll` | 5 | 倒數結束後的檢查間隔（秒），直到偵測到寶箱 |
 | `--interval` | 30 | 找不到視窗或泡泡時的重試間隔（秒） |
 | `--threshold` | 0.85 | 寶箱比對門檻 |
 | `--dry` | | 只偵測不點擊 |
@@ -64,5 +67,5 @@ python auto_tappo.py --dry    # 只偵測不點擊
 
 ### 換寶箱模板
 寶箱外觀改變時：等寶箱出現時 `python auto_tappo.py snap`，把寶箱圖示（只裁圖示本體）
-存成 PNG 放進 `templates/`。模板需在 **150% 縮放** 的螢幕上截取（`TEMPLATE_DPI = 144`），
-否則請改 `auto_tappo.py` 中的常數。
+存成 PNG 放進 `templates/`，並把 `auto_tappo.py` 的 `CHEST_BUBBLE_H` 改成截圖時寶箱泡泡框的高度（像素），
+程式會以此為基準依實際泡泡大小縮放模板。

@@ -64,7 +64,8 @@ class TrayApp:
         self.icon.stop()
 
     def worker(self):
-        args = argparse.Namespace(threshold=0.85, interval=30.0, max_wait=600.0, dry=False)
+        args = argparse.Namespace(threshold=0.85, interval=30.0, max_wait=600.0, poll=5.0,
+                                  dry=False)
         try:
             ok = core.cmd_run(args)
             if ok is False:
