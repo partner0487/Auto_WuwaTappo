@@ -17,6 +17,7 @@
 import argparse
 import asyncio
 import ctypes
+import ctypes.wintypes
 import glob
 import os
 import re
@@ -380,18 +381,107 @@ def scan(hwnd, threshold, check_owner=True):
 
 # ---------- 點擊 ----------
 
-def click(x, y):
-    """點擊螢幕座標 (x, y)，點完把滑鼠移回原位。"""
-    old = win32api.GetCursorPos()
-    win32api.SetCursorPos((x - 2, y - 2))
-    time.sleep(0.05)
-    win32api.SetCursorPos((x, y))  # 先產生 hover，WebView 才會正確 hit-test
+SHELL_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"}
+
+
+def fullscreen_app(pet_pid):
+    """前景是全螢幕程式（遊戲、影片）時回傳其視窗標題，否則 None。
+
+    這時點寶箱會把焦點從遊戲搶走，而且遊戲常把滑鼠鎖在自己視窗內（移不過去也移不回來）。
+    """
+    fg = win32gui.GetForegroundWindow()
+    if not fg or win32gui.GetClassName(fg) in SHELL_CLASSES:
+        return None
+    if not win32gui.IsWindowVisible(fg) or _cloaked(fg):
+        return None
+    if win32process.GetWindowThreadProcessId(fg)[1] == pet_pid:
+        return None
+    style = win32gui.GetWindowLong(fg, win32con.GWL_STYLE)
+    if style & win32con.WS_CAPTION == win32con.WS_CAPTION:  # 一般有標題列的視窗（含最大化）
+        return None
+    try:
+        l, t, r, b = win32gui.GetWindowRect(fg)
+        mon = win32api.GetMonitorInfo(
+            win32api.MonitorFromWindow(fg, win32con.MONITOR_DEFAULTTONEAREST))["Monitor"]
+    except Exception:
+        return None
+    if l <= mon[0] and t <= mon[1] and r >= mon[2] and b >= mon[3]:
+        return win32gui.GetWindowText(fg) or win32gui.GetClassName(fg)
+    return None
+
+
+def cursor_locked(x, y):
+    """滑鼠被限制在某個範圍（ClipCursor，遊戲常用）且 (x, y) 不在範圍內。"""
+    rc = ctypes.wintypes.RECT()
+    if not ctypes.windll.user32.GetClipCursor(ctypes.byref(rc)):
+        return False
+    return not (rc.left <= x < rc.right and rc.top <= y < rc.bottom)
+
+
+def _cloaked(hwnd):
+    """被 DWM 隱藏的視窗（看不見的 UWP 系統視窗等）。"""
+    val = ctypes.c_int(0)
+    ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(val), 4)  # DWMWA_CLOAKED
+    return val.value != 0
+
+
+def _move_cursor(pos, tries=5):
+    for _ in range(tries):
+        try:
+            win32api.SetCursorPos(pos)
+        except Exception:
+            pass
+        if win32api.GetCursorPos() == tuple(pos):
+            return True
+        time.sleep(0.03)
+    return False
+
+
+def bg_click(hwnd, x, y):
+    """背景點擊：不移動滑鼠、不搶焦點，直接把滑鼠訊息送進桌寵的 WebView 輸入視窗。
+
+    回傳是否有送出（找不到輸入視窗時 False）。是否真的點到要由呼叫端重新掃描確認。
+    """
+    target = []
+
+    def cb(w, _):
+        if not target and win32gui.GetClassName(w) == "Chrome_RenderWidgetHostHWND" \
+                and win32gui.IsWindowVisible(w):
+            target.append(w)
+    try:
+        win32gui.EnumChildWindows(hwnd, cb, None)
+    except Exception:
+        pass
+    if not target:
+        return False
+    hw = target[0]
+    cx, cy = win32gui.ScreenToClient(hw, (x, y))
+    lp = win32api.MAKELONG(cx & 0xFFFF, cy & 0xFFFF)
+    win32gui.PostMessage(hw, win32con.WM_MOUSEMOVE, 0, lp)  # 先 hover，WebView 才會正確 hit-test
     time.sleep(0.1)
-    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0)
+    win32gui.PostMessage(hw, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lp)
     time.sleep(0.08)
-    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0)
-    time.sleep(0.05)
-    win32api.SetCursorPos(old)
+    win32gui.PostMessage(hw, win32con.WM_LBUTTONUP, 0, lp)
+    return True
+
+
+def click(x, y):
+    """點擊螢幕座標 (x, y)，點完把滑鼠移回原位。滑鼠移不過去就不點，回傳 False。"""
+    old = win32api.GetCursorPos()
+    try:
+        _move_cursor((x - 2, y - 2), tries=1)
+        time.sleep(0.05)
+        if not _move_cursor((x, y)):  # 先產生 hover，WebView 才會正確 hit-test
+            return False
+        time.sleep(0.1)
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0)
+        time.sleep(0.08)
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0)
+        time.sleep(0.05)
+        return True
+    finally:
+        if not _move_cursor(old):
+            log(f"滑鼠無法移回原位 {old}")
 
 
 # ---------- 指令 ----------
@@ -430,6 +520,8 @@ def cmd_run(args):
         os.remove(STOP_FILE)
     log("開始自動領取" + ("（dry run，不點擊）" if args.dry else "") + f"（PID {os.getpid()}）")
     hwnd, stuck = None, 0
+    deferred = None         # 因全螢幕程式而暫緩點擊時，記錄是哪個程式（只記一次紀錄）
+    bg_tries, bg_failed = 0, False  # 背景點擊連續失敗次數／是否已放棄背景點擊
     max_timers = 0          # 曾同時讀到幾個倒數（＝泡泡數），少了代表有泡泡倒數結束
     waiting_since = None    # 進入「時間到、等寶箱」狀態的時間
     while True:
@@ -447,12 +539,49 @@ def cmd_run(args):
             if chests:
                 waiting_since = None
                 x, y, score, name = chests[0]
+                if not args.dry and not bg_failed and bg_click(hwnd, x, y):
+                    # 先試背景點擊：不動滑鼠、不搶焦點，全螢幕遊戲中也能領
+                    if nap(2):
+                        break
+                    after, _ = scan(hwnd, args.threshold)
+                    if not after:
+                        log(f"寶箱 x{len(chests)}，背景點擊 ({x}, {y}) 成功（{name} {score:.2f}）")
+                        stuck, deferred, bg_tries = 0, None, 0
+                        continue
+                    bg_tries += 1
+                    if bg_tries >= 2:  # 連續失敗就不再試，直接用滑鼠點
+                        log("背景點擊無效，改用滑鼠點擊")
+                        bg_failed = True
+                    chests = after
+                    x, y, score, name = chests[0]
+                    if not bg_failed:
+                        continue
+                # 全螢幕遊戲中不點：會搶走焦點，滑鼠也可能被遊戲鎖住
+                pet_pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+                busy = fullscreen_app(pet_pid)
+                if not busy and cursor_locked(x, y):
+                    busy = "滑鼠被其他程式鎖定"
+                if busy:
+                    if deferred != busy:
+                        log(f"寶箱已出現，但全螢幕程式使用中（{busy[:30]}），"
+                            f"暫緩點擊，每 {args.poll:.0f} 秒確認")
+                        deferred = busy
+                    if nap(args.poll):
+                        break
+                    continue
+                if deferred:
+                    log("已離開全螢幕，繼續領取")
+                    deferred = None
                 log(f"寶箱 x{len(chests)}，點擊 ({x}, {y})（{name} {score:.2f}）")
                 if args.dry:
                     if nap(args.interval):
                         break
                     continue
-                click(x, y)
+                if not click(x, y):
+                    log(f"滑鼠移不到寶箱位置，{args.poll:.0f} 秒後再試")
+                    if nap(args.poll):
+                        break
+                    continue
                 if nap(2):  # 等泡泡切換成倒數
                     break
                 stuck += 1
