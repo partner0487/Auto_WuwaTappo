@@ -15,6 +15,7 @@
 程式會依桌寵所在螢幕的 DPI 自動縮放模板。
 """
 import argparse
+import asyncio
 import ctypes
 import glob
 import os
@@ -33,8 +34,11 @@ import win32event
 import win32gui
 import win32process
 import winerror
-import winocr
 from PIL import Image, ImageGrab
+from winrt.windows.globalization import Language
+from winrt.windows.graphics.imaging import BitmapPixelFormat, SoftwareBitmap
+from winrt.windows.media.ocr import OcrEngine
+from winrt.windows.storage.streams import DataWriter
 
 ctypes.windll.shcore.SetProcessDpiAwareness(2)  # 座標用實際像素，避免高 DPI 縮放錯位
 
@@ -59,6 +63,7 @@ BUBBLE_HSV_HI = (35, 150, 255)
 # 泡泡大小（100% 縮放下，像素），實際依 DPI 等比放大
 BUBBLE_W = (25, 80)
 BUBBLE_H = (12, 45)
+OCR_LANG_PREF = ["en-US", "en-GB", "en"]  # 依序嘗試，都沒有就用系統語言
 TIMER_RE = re.compile(r"(\d{1,2})\s*[:：.]\s*(\d{2})")
 
 
@@ -188,16 +193,65 @@ def find_bubbles(frame, scale):
     return boxes
 
 
+_ocr_engine = None
+_ocr_checked = False
+
+
+def get_ocr_engine():
+    """取得 Windows OCR 引擎：優先英文，沒有就用使用者的系統語言（如繁中），再不行用任一已安裝語言。
+    數字與冒號各語言都認得，所以不一定要英文語言包。都沒有時回 None（只點寶箱、不讀倒數）。"""
+    global _ocr_engine, _ocr_checked
+    if _ocr_checked:
+        return _ocr_engine
+    _ocr_checked = True
+    engine = None
+    for tag in OCR_LANG_PREF:
+        if OcrEngine.is_language_supported(Language(tag)):
+            engine = OcrEngine.try_create_from_language(Language(tag))
+            break
+    if engine is None:
+        engine = OcrEngine.try_create_from_user_profile_languages()
+    if engine is None:
+        langs = list(OcrEngine.available_recognizer_languages)
+        if langs:
+            engine = OcrEngine.try_create_from_language(langs[0])
+    if engine is None:
+        log("這台電腦沒有任何 Windows OCR 語言，無法讀倒數；改為定時檢查寶箱。"
+            "可到「設定 → 時間與語言 → 語言」新增英文（含光學字元辨識）")
+    else:
+        log(f"OCR 語言：{engine.recognizer_language.language_tag}")
+    _ocr_engine = engine
+    return engine
+
+
+def ocr_text(gray):
+    engine = get_ocr_engine()
+    if engine is None:
+        return ""
+    rgba = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGBA)
+    writer = DataWriter()
+    writer.write_bytes(rgba.tobytes())
+    bmp = SoftwareBitmap.create_copy_from_buffer(
+        writer.detach_buffer(), BitmapPixelFormat.RGBA8, rgba.shape[1], rgba.shape[0])
+
+    async def run():
+        return await engine.recognize_async(bmp)
+
+    return asyncio.run(run()).text
+
+
 def read_timer(crop, region, scale):
     """OCR 泡泡內的 mm:ss，回傳秒數或 None。
     只留泡泡內部，二值化成白底黑字再放大，避免外框/背景干擾 OCR。"""
+    if get_ocr_engine() is None:
+        return None
     v = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)[:, :, 2]
     img = np.full_like(v, 255)
     img[(region > 0) & (v < 205)] = 0  # 咖啡色文字
     for f in (4 / scale, 3 / scale):  # 放大到相當於 100% 縮放的 3~4 倍
         big = cv2.resize(img, None, fx=f, fy=f, interpolation=cv2.INTER_CUBIC)
         big = cv2.copyMakeBorder(big, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
-        text = winocr.recognize_pil_sync(Image.fromarray(big).convert("RGB"), "en-US")["text"]
+        text = ocr_text(big)
         m = TIMER_RE.search(re.sub(r"[\s•·]", "", text))
         if m:
             mm, ss = int(m.group(1)), int(m.group(2))
@@ -325,7 +379,10 @@ def cmd_run(args):
                     break
                 continue
 
-            log(f"沒看到泡泡框（桌寵被移走或隱藏？），{args.interval:.0f}s 後再試")
+            if get_ocr_engine() is None:
+                log(f"無 OCR 可讀倒數，{args.interval:.0f}s 後再檢查寶箱")
+            else:
+                log(f"沒看到泡泡框（桌寵被移走或隱藏？），{args.interval:.0f}s 後再試")
             if nap(args.interval):
                 break
         except KeyboardInterrupt:

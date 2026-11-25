@@ -10,5 +10,4 @@ pyinstaller --noconfirm --clean --onefile --windowed --uac-admin ^
   --add-data "templates;templates" ^
   --add-data "assets\icon.png;assets" ^
   --collect-all winrt ^
-  --hidden-import winocr ^
   %* tray_app.py

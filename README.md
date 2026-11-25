@@ -33,7 +33,7 @@ build.bat            用 PyInstaller 打包成 dist\AutoWuwaTappo.exe
 ```
 
 ## 開發
-需求：Windows 10/11（含英文 OCR 語言，一般預設就有）、Python 3.10+
+需求：Windows 10/11（OCR 優先用英文，沒有就用系統語言如繁中）、Python 3.10+
 ```
 pip install -r requirements.txt
 python tray_app.py            # 系統匣版
