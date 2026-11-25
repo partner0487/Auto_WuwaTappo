@@ -41,6 +41,11 @@ from winrt.windows.graphics.imaging import BitmapPixelFormat, SoftwareBitmap
 from winrt.windows.media.ocr import OcrEngine
 from winrt.windows.storage.streams import DataWriter
 
+try:  # Windows Graphics Capture：截桌寵視窗本身（被遮住也行）
+    from windows_capture import WindowsCapture
+except Exception:
+    WindowsCapture = None
+
 ctypes.windll.shcore.SetProcessDpiAwareness(2)  # 座標用實際像素，避免高 DPI 縮放錯位
 
 FROZEN = getattr(sys, "frozen", False)  # PyInstaller 打包後
@@ -74,10 +79,28 @@ OCR_LANG_PREF = ["en-US", "en-GB", "en"]  # 依序嘗試，都沒有就用系統
 TIMER_RE = re.compile(r"(\d{1,2})\s*[:：.]\s*(\d{2})")
 
 
+VERSION = "1.1.0"
+QUIT_EVENT_NAME = "Local\\AutoWuwaTappo.Quit"  # 新版啟動時用來通知舊版結束
+
 _log_to_file = False
 stop_event = threading.Event()  # 系統匣「結束」
 wake_event = threading.Event()  # 系統匣「立即檢查」
 log_listeners = []  # 每筆紀錄都會呼叫 fn(msg)，系統匣用來更新狀態
+
+# 給視窗顯示用的狀態。phase：starting / countdown / waiting / deferred / nopet / nobubble / error
+# until：countdown 時為下一個寶箱出現的時間（epoch 秒）
+state = {"phase": "starting", "detail": "", "until": None,
+         "claims": 0, "last_claim": None, "last_method": ""}
+
+
+def set_state(phase, detail="", until=None):
+    state.update(phase=phase, detail=detail, until=until)
+
+
+def record_claim(method):
+    state["claims"] += 1
+    state["last_claim"] = time.time()
+    state["last_method"] = method
 
 
 def log(msg):
@@ -124,6 +147,49 @@ def is_running():
         return e.winerror == winerror.ERROR_ACCESS_DENIED
 
 
+def listen_quit():
+    """背景等待「請結束」訊號（新版啟動時送出），收到就停止。回傳事件 handle（需保留）。"""
+    ev = win32event.CreateEvent(None, True, False, QUIT_EVENT_NAME)
+    win32event.ResetEvent(ev)  # 可能是新版剛送過的訊號，自己啟動前先清掉
+
+    def run():
+        while not stop_event.is_set():
+            if win32event.WaitForSingleObject(ev, 500) == win32event.WAIT_OBJECT_0:
+                log("新版本已啟動，這一份結束")
+                stop_event.set()
+                return
+    threading.Thread(target=run, daemon=True).start()
+    return ev
+
+
+def take_over(timeout=10.0):
+    """已有一份在執行時，請它結束（舊版不認得訊號就強制結束），讓這一份接手。"""
+    if not is_running():
+        return
+    log("偵測到已有一份在執行，通知它結束")
+    ev = win32event.CreateEvent(None, True, False, QUIT_EVENT_NAME)
+    win32event.SetEvent(ev)
+    end = time.time() + timeout
+    while is_running() and time.time() < end:
+        time.sleep(0.3)
+    if is_running():  # v1.0.5 以前的版本不認得訊號
+        import psutil
+        me = psutil.Process()
+        skip = {me.pid} | {p.pid for p in me.parents()}  # 打包版自己的啟動程序也叫這個名字
+        for p in psutil.process_iter(["name"]):
+            if (p.info["name"] or "").lower() == "autowuwatappo.exe" and p.pid not in skip:
+                try:
+                    p.kill()
+                    log(f"強制結束舊版（PID {p.pid}）")
+                except Exception as e:
+                    log(f"無法結束舊版（PID {p.pid}）：{e}")
+        end = time.time() + 5
+        while is_running() and time.time() < end:
+            time.sleep(0.3)
+    win32event.ResetEvent(ev)
+    win32api.CloseHandle(ev)
+
+
 def fmt(sec):
     return f"{int(sec) // 60:02d}:{int(sec) % 60:02d}"
 
@@ -155,11 +221,66 @@ def window_dpi(hwnd):
     return x.value or 96
 
 
+_wgc_ok = True        # 上次 WGC 是否成功（只在狀態改變時寫紀錄）
+_wgc_retry_at = 0.0   # WGC 失敗後，暫停到這個時間再試
+
+
+def grab_wgc(hwnd, timeout=3.0):
+    """用 Windows Graphics Capture 只截桌寵視窗本身的內容（被其他視窗蓋住也截得到）。
+    透明處為黑色。失敗回傳 None。"""
+    box, done = {}, threading.Event()
+    for border in (False, None):  # 不畫黃框需 Win11；舊版 Windows 不支援就用預設
+        try:
+            cap = WindowsCapture(cursor_capture=False, draw_border=border, window_hwnd=hwnd)
+            break
+        except Exception:
+            cap = None
+    if cap is None:
+        return None
+
+    @cap.event
+    def on_frame_arrived(frame, control):
+        if "img" not in box:
+            box["img"] = frame.frame_buffer[:, :, :3].copy()  # BGRA → BGR
+        control.stop()
+        done.set()
+
+    @cap.event
+    def on_closed():
+        done.set()
+
+    control = cap.start_free_threaded()
+    if not done.wait(timeout):
+        try:
+            control.stop()
+        except Exception:
+            pass
+    return box.get("img")
+
+
 def grab(hwnd):
-    """截桌寵視窗範圍，回傳 (BGR 影像, 視窗左上角螢幕座標)。"""
+    """截桌寵視窗，回傳 (BGR 影像, 視窗左上角螢幕座標, 是否只含桌寵本身)。
+
+    優先用 WGC（只有桌寵的畫面，不受遮擋、也不會截到其他視窗）；失敗才截螢幕上該範圍。
+    """
+    global _wgc_ok, _wgc_retry_at
     l, t, r, b = win32gui.GetWindowRect(hwnd)
+    if WindowsCapture is not None and time.time() >= _wgc_retry_at:
+        try:
+            img = grab_wgc(hwnd)
+        except Exception as e:
+            img = None
+            log(f"WGC 截圖錯誤：{e!r}")
+        if img is not None and img.shape[:2] == (b - t, r - l):
+            if not _wgc_ok:
+                log("視窗截圖（WGC）恢復可用")
+            _wgc_ok = True
+            return np.ascontiguousarray(img), (l, t), True
+        if _wgc_ok:
+            log("視窗截圖（WGC）無法使用，暫時改用螢幕截圖（桌寵被蓋住時會偵測不到），10 分鐘後再試")
+        _wgc_ok, _wgc_retry_at = False, time.time() + 600
     img = ImageGrab.grab(bbox=(l, t, r, b), all_screens=True)
-    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR), (l, t)
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR), (l, t), False
 
 
 # ---------- 偵測 ----------
@@ -348,12 +469,29 @@ def owned_by_pet(pid, points):
     return False
 
 
+def covered_at(hwnd, x, y):
+    """螢幕座標 (x, y) 上，是否有其他程式的可見視窗疊在桌寵視窗上面（依 Z 順序往上找）。
+    桌寵視窗平常是滑鼠穿透的，不能用 WindowFromPoint 判斷。"""
+    pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+    w = win32gui.GetWindow(hwnd, win32con.GW_HWNDPREV)
+    while w:
+        if (win32gui.IsWindowVisible(w) and not win32gui.IsIconic(w) and not _cloaked(w)
+                and win32process.GetWindowThreadProcessId(w)[1] != pid):
+            l, t, r, b = win32gui.GetWindowRect(w)
+            if l <= x < r and t <= y < b and r - l > 1 and b - t > 1:
+                return True
+        w = win32gui.GetWindow(w, win32con.GW_HWNDPREV)
+    return False
+
+
 def scan(hwnd, threshold, check_owner=True):
     """掃一次桌寵視窗。回傳 (chests=[(螢幕x, 螢幕y, 分數, 模板名)], timers=[秒數])。
-    check_owner：只採用確實屬於桌寵程式的泡泡（測試離線截圖時設 False）。"""
+    check_owner：螢幕截圖時只採用確實屬於桌寵程式的泡泡（測試離線截圖時設 False）。
+    WGC 截圖本來就只有桌寵的畫面，不必檢查（被蓋住時檢查反而會誤刪）。"""
     dpi = window_dpi(hwnd)
     scale = dpi / 96
-    frame, (ox, oy) = grab(hwnd)
+    frame, (ox, oy), isolated = grab(hwnd)
+    check_owner = check_owner and not isolated
     tpls = load_templates()
     pid = win32process.GetWindowThreadProcessId(hwnd)[1] if check_owner else None
     chests, timers = [], []
@@ -492,7 +630,7 @@ def cmd_snap():
         log("找不到 Wuwa Tappo 視窗，請先開啟桌寵")
         return
     os.makedirs(SNAP_DIR, exist_ok=True)
-    frame, _ = grab(hwnd)
+    frame, _, _ = grab(hwnd)
     path = os.path.join(SNAP_DIR, f"snap_{datetime.now():%Y%m%d_%H%M%S}.png")
     cv2.imencode(".png", frame)[1].tofile(path)
     log(f"已存 {path}")
@@ -518,10 +656,13 @@ def cmd_run(args):
         return False
     if os.path.exists(STOP_FILE):
         os.remove(STOP_FILE)
-    log("開始自動領取" + ("（dry run，不點擊）" if args.dry else "") + f"（PID {os.getpid()}）")
+    quit_ev = listen_quit()  # noqa: F841  保留 handle 直到結束
+    log(f"開始自動領取 v{VERSION}" + ("（dry run，不點擊）" if args.dry else "") + f"（PID {os.getpid()}）")
     hwnd, stuck = None, 0
+    pending_click = False   # 用滑鼠點過，下一輪寶箱不見才算領到
     deferred = None         # 因全螢幕程式而暫緩點擊時，記錄是哪個程式（只記一次紀錄）
-    bg_tries, bg_failed = 0, False  # 背景點擊連續失敗次數／是否已放棄背景點擊
+    # 背景點擊連續失敗次數／暫停背景點擊到何時／是否已記過失敗
+    bg_tries, bg_pause_until, bg_warned = 0, 0, False
     max_timers = 0          # 曾同時讀到幾個倒數（＝泡泡數），少了代表有泡泡倒數結束
     waiting_since = None    # 進入「時間到、等寶箱」狀態的時間
     while True:
@@ -530,47 +671,60 @@ def cmd_run(args):
                 hwnd = find_pet_window()
                 max_timers, waiting_since = 0, None
                 if not hwnd:
+                    set_state("nopet", "請開啟 Wuwa Tappo 桌寵")
                     log(f"找不到桌寵視窗，{args.interval:.0f}s 後再試")
                     if nap(args.interval):
                         break
                     continue
             chests, timers = scan(hwnd, args.threshold)
+            if pending_click and not chests:
+                record_claim("滑鼠點擊")
+            pending_click = False
 
             if chests:
                 waiting_since = None
                 x, y, score, name = chests[0]
-                if not args.dry and not bg_failed and bg_click(hwnd, x, y):
+                if not args.dry and time.time() >= bg_pause_until and bg_click(hwnd, x, y):
                     # 先試背景點擊：不動滑鼠、不搶焦點，全螢幕遊戲中也能領
                     if nap(2):
                         break
                     after, _ = scan(hwnd, args.threshold)
                     if not after:
                         log(f"寶箱 x{len(chests)}，背景點擊 ({x}, {y}) 成功（{name} {score:.2f}）")
+                        record_claim("背景點擊")
                         stuck, deferred, bg_tries = 0, None, 0
                         continue
                     bg_tries += 1
-                    if bg_tries >= 2:  # 連續失敗就不再試，直接用滑鼠點
-                        log("背景點擊無效，改用滑鼠點擊")
-                        bg_failed = True
+                    if bg_tries < 2:  # 再試一次背景點擊（寶箱剛彈出時可能還點不到）
+                        continue
+                    # 連續失敗：這個寶箱先改用滑鼠點，60 秒後再試背景點擊（不永久放棄）
+                    if not bg_warned:
+                        log("背景點擊無效，改用滑鼠點擊（之後仍會再試背景點擊）")
+                        bg_warned = True
+                    bg_tries, bg_pause_until = 0, time.time() + 60
                     chests = after
                     x, y, score, name = chests[0]
-                    if not bg_failed:
-                        continue
                 # 全螢幕遊戲中不點：會搶走焦點，滑鼠也可能被遊戲鎖住
                 pet_pid = win32process.GetWindowThreadProcessId(hwnd)[1]
                 busy = fullscreen_app(pet_pid)
                 if not busy and cursor_locked(x, y):
                     busy = "滑鼠被其他程式鎖定"
+                if not busy and covered_at(hwnd, x, y):
+                    busy = "寶箱被其他視窗蓋住"  # 滑鼠點下去會點到上面那個視窗
                 if busy:
+                    set_state("deferred", busy if busy in ("滑鼠被其他程式鎖定", "寶箱被其他視窗蓋住")
+                              else f"全螢幕程式使用中：{busy[:30]}")
                     if deferred != busy:
-                        log(f"寶箱已出現，但全螢幕程式使用中（{busy[:30]}），"
+                        reason = busy if busy in ("滑鼠被其他程式鎖定", "寶箱被其他視窗蓋住") \
+                            else f"全螢幕程式使用中：{busy[:30]}"
+                        log(f"寶箱已出現，但暫時不能用滑鼠點（{reason}），"
                             f"暫緩點擊，每 {args.poll:.0f} 秒確認")
                         deferred = busy
                     if nap(args.poll):
                         break
                     continue
                 if deferred:
-                    log("已離開全螢幕，繼續領取")
+                    log("可以點了，繼續領取")
                     deferred = None
                 log(f"寶箱 x{len(chests)}，點擊 ({x}, {y})（{name} {score:.2f}）")
                 if args.dry:
@@ -582,6 +736,7 @@ def cmd_run(args):
                     if nap(args.poll):
                         break
                     continue
+                pending_click = True
                 if nap(2):  # 等泡泡切換成倒數
                     break
                 stuck += 1
@@ -592,10 +747,12 @@ def cmd_run(args):
                     stuck = 0
                 continue
             stuck = 0
+            bg_tries, bg_pause_until, bg_warned = 0, 0, False  # 下一個寶箱重新從背景點擊開始
 
             # 時間到（倒數歸零，或讀到的倒數比之前少）但還沒看到寶箱 → 每 5 秒檢查直到偵測到
             max_timers = max(max_timers, len(timers))
             if (timers and min(timers) <= 1) or len(timers) < max_timers:
+                set_state("waiting", f"每 {args.poll:.0f} 秒檢查一次")
                 if waiting_since is None:
                     waiting_since = time.time()
                     log(f"時間到，每 {args.poll:.0f} 秒檢查直到偵測到寶箱")
@@ -609,6 +766,7 @@ def cmd_run(args):
             waiting_since = None
 
             if timers:
+                set_state("countdown", f"{len(timers)} 個倒數泡泡", time.time() + min(timers))
                 wait = min(min(timers) + 1, args.max_wait)
                 log(f"倒數 {', '.join(fmt(t) for t in sorted(timers))}；"
                     f"{datetime.now() + timedelta(seconds=wait):%H:%M:%S} 再檢查")
@@ -617,8 +775,10 @@ def cmd_run(args):
                 continue
 
             if get_ocr_engine() is None:
+                set_state("nobubble", "系統沒有 OCR，改為定時檢查寶箱")
                 log(f"無 OCR 可讀倒數，{args.interval:.0f}s 後再檢查寶箱")
             else:
+                set_state("nobubble", "桌寵被移走或隱藏？")
                 log(f"沒看到泡泡框（桌寵被移走或隱藏？），{args.interval:.0f}s 後再試")
             if nap(args.interval):
                 break
@@ -626,6 +786,7 @@ def cmd_run(args):
             raise
         except Exception as e:  # 截圖偶發失敗（鎖定畫面、切換螢幕等）不中斷
             log(f"錯誤：{e}")
+            set_state("error", str(e)[:60])
             hwnd = None
             if nap(args.interval):
                 break
